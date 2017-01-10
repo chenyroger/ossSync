@@ -22,6 +22,10 @@ var (
 
 var configList = make(map[string]string)
 var syncPerPage int = 1000
+var thread int = 2
+var errorObject chan oss.ObjectProperties = make(chan oss.ObjectProperties)
+var errorObjectChan chan string = make(chan string)
+var quit chan int = make(chan int, 1)
 
 const (
 	configCommonSection = "common"
@@ -43,8 +47,8 @@ type ossPackage struct {
 	DestBucket   *oss.Bucket
 	objectList   []oss.ObjectProperties
 	Config       map[string]string
-	errorObject  []string
-	lastMarker   string
+	errorObjects []oss.ObjectProperties
+	processChan  chan string
 }
 
 func (o *ossPackage) getObjectList(marker string) ([]oss.ObjectProperties, string, error) {
@@ -59,12 +63,83 @@ func (o *ossPackage) getObjectList(marker string) ([]oss.ObjectProperties, strin
 	return objectResult, lor.NextMarker, nil
 }
 
-func (o *ossPackage) writeLastMarkerFile(content string) error {
+func writeLastMarkerFile(content string) error {
 	if content == "" {
 		return nil
 	}
 	err := ioutil.WriteFile(lastMarkerFile, []byte(content), os.ModePerm)
 	return err
+}
+
+func goProcess(o *ossPackage, objects []oss.ObjectProperties) {
+	for _, v := range objects {
+		body, err := o.SourceBucket.GetObject(v.Key)
+		if err != nil {
+			errorObject <- v
+			continue
+		}
+		defer body.Close()
+		data, err := ioutil.ReadAll(body)
+		if err != nil {
+			errorObject <- v
+			continue
+		}
+
+		if o.Config["syncMode"] == "2" {
+			dir, file := path.Split(o.Config["downloadDir"] + "/" + v.Key)
+			if PathExists(dir) == false {
+				os.MkdirAll(dir, 0777)
+			}
+			err := ioutil.WriteFile(dir + file, data, os.ModePerm)
+			if err != nil {
+				errorObject <- v
+				continue
+			}
+		}
+
+		err = o.DestBucket.PutObject(v.Key, bytes.NewReader(data))
+		if err != nil {
+			errorObject <- v
+			continue
+		}
+		fmt.Println("synced:", v.Key)
+	}
+	<-o.processChan
+}
+
+func goProcessErrorObjects(o *ossPackage) {
+	for _, v := range o.errorObjects {
+		body, err := o.SourceBucket.GetObject(v.Key)
+		if err != nil {
+			fmt.Println(err.Error())
+			continue
+		}
+		defer body.Close()
+		data, err := ioutil.ReadAll(body)
+		if err != nil {
+			fmt.Println(err.Error())
+			continue
+		}
+
+		if o.Config["syncMode"] == "2" {
+			dir, file := path.Split(o.Config["downloadDir"] + "/" + v.Key)
+			if PathExists(dir) == false {
+				os.MkdirAll(dir, 0777)
+			}
+			err := ioutil.WriteFile(dir + file, data, os.ModePerm)
+			if err != nil {
+				fmt.Println(err.Error())
+				continue
+			}
+		}
+
+		err = o.DestBucket.PutObject(v.Key, bytes.NewReader(data))
+		if err != nil {
+			fmt.Println(err.Error())
+			continue
+		}
+		errorObjectChan <- "resynced: " + v.Key
+	}
 }
 
 func (o *ossPackage) ProcessObjectList() error {
@@ -76,8 +151,16 @@ func (o *ossPackage) ProcessObjectList() error {
 			fmt.Println("marker reset:", marker)
 		}
 	}
-	backMarker := ""
+	go func() {
+		for {
+			select {
+			case res := <-errorObject:
+				o.errorObjects = append(o.errorObjects, res)
+			}
+		}
+	}()
 	for {
+		o.processChan <- "start"
 		objectResult, nextMarker, err := o.getObjectList(marker)
 		if err != nil {
 			return err
@@ -85,46 +168,13 @@ func (o *ossPackage) ProcessObjectList() error {
 		if len(objectResult) == 0 {
 			return errors.New("ossList is empty!")
 		}
-
-		for _, v := range objectResult {
-			body, err := o.SourceBucket.GetObject(v.Key)
-			if err != nil {
-				o.writeLastMarkerFile(backMarker)
-				return err
-			}
-			defer body.Close()
-			data, err := ioutil.ReadAll(body)
-			if err != nil {
-				o.writeLastMarkerFile(backMarker)
-				return err
-			}
-
-			if o.Config["syncMode"] == "2" {
-				dir, file := path.Split(o.Config["downloadDir"] + "/" + v.Key)
-				if PathExists(dir) == false {
-					os.MkdirAll(dir, 0777)
-				}
-				err := ioutil.WriteFile(dir + file, data, os.ModePerm)
-				if err != nil {
-					o.writeLastMarkerFile(backMarker)
-					return err
-				}
-			}
-
-			err = o.DestBucket.PutObject(v.Key, bytes.NewReader(data))
-			if err != nil {
-				o.writeLastMarkerFile(backMarker)
-				return err
-			}
-			backMarker = v.Key
-
-			fmt.Println("synced:", v.Key)
-		}
+		go goProcess(o, objectResult)
 		if nextMarker == "" {
 			break
 		}
 		marker = nextMarker
 	}
+
 	return nil
 }
 
@@ -217,21 +267,42 @@ func main() {
 
 	if maxKeys, ok := configList["maxKeys"]; ok {
 		maxKeys, _ := strconv.Atoi(maxKeys)
-		if maxKeys < syncPerPage {
+		if maxKeys < syncPerPage && maxKeys>0 {
 			syncPerPage = maxKeys
 		}
 	}
-
 	fmt.Println("Max keys: ", syncPerPage)
+	if _thread, ok := configList["thread"]; ok {
+		newThread, _ := strconv.Atoi(_thread)
+		if newThread<1{
+			thread = 1
+		}
+
+	}
+	fmt.Println("Threads: ", thread)
 	fmt.Println("sync start...")
 
-	ossPackage := &ossPackage{SourceBucket:sourceBucket, DestBucket:destBucket, Config:configList}
+	ossPackage := &ossPackage{SourceBucket:sourceBucket, DestBucket:destBucket, Config:configList, processChan:make(chan string, thread)}
 	err = ossPackage.ProcessObjectList()
 	if err != nil {
 		fmt.Println(err.Error())
 	} else {
 		os.Remove(lastMarkerFile)
 	}
+	errorObjectsLen := len(ossPackage.errorObjects)
+	if errorObjectsLen > 0 {
+		fmt.Println("errorObject Len:", errorObjectsLen)
+		go goProcessErrorObjects(ossPackage)
+		i := 0
+		for i < errorObjectsLen {
+			select {
+			case res := <-errorObjectChan:
+				fmt.Println(res)
+				i++
+			}
+		}
+	}
+
 	endTime := time.Now().Unix()
 	fmt.Printf("runTime: %v seconds", (endTime - startTime))
 }
