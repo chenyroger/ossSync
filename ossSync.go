@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	configFile = flag.String("configfile", "config.ini", "General configuration file")
+	configFile = flag.String("f", "config.ini", "General configuration file")
 )
 
 var configList = make(map[string]string)
@@ -25,7 +25,6 @@ var syncPerPage int = 1000
 var thread int = 2
 var errorObject chan oss.ObjectProperties = make(chan oss.ObjectProperties)
 var errorObjectChan chan string = make(chan string)
-var quit chan int = make(chan int, 1)
 
 const (
 	configCommonSection = "common"
@@ -43,17 +42,17 @@ func PathExists(path string) bool {
 }
 
 type ossPackage struct {
-	SourceBucket *oss.Bucket
-	DestBucket   *oss.Bucket
+	sourceBucket *oss.Bucket
+	destBucket   *oss.Bucket
 	objectList   []oss.ObjectProperties
-	Config       map[string]string
+	config       map[string]string
 	errorObjects []oss.ObjectProperties
 	processChan  chan string
 }
 
 func (o *ossPackage) getObjectList(marker string) ([]oss.ObjectProperties, string, error) {
 	objectResult := make([]oss.ObjectProperties, 0)
-	lor, err := o.SourceBucket.ListObjects(oss.MaxKeys(syncPerPage), oss.Prefix(o.Config["srcPrefix"]), oss.Marker(marker))
+	lor, err := o.sourceBucket.ListObjects(oss.MaxKeys(syncPerPage), oss.Prefix(o.config["srcPrefix"]), oss.Marker(marker))
 	if err != nil {
 		return nil, "", err
 	}
@@ -63,17 +62,9 @@ func (o *ossPackage) getObjectList(marker string) ([]oss.ObjectProperties, strin
 	return objectResult, lor.NextMarker, nil
 }
 
-func writeLastMarkerFile(content string) error {
-	if content == "" {
-		return nil
-	}
-	err := ioutil.WriteFile(lastMarkerFile, []byte(content), os.ModePerm)
-	return err
-}
-
 func goProcess(o *ossPackage, objects []oss.ObjectProperties) {
 	for _, v := range objects {
-		body, err := o.SourceBucket.GetObject(v.Key)
+		body, err := o.sourceBucket.GetObject(v.Key)
 		if err != nil {
 			errorObject <- v
 			continue
@@ -85,8 +76,8 @@ func goProcess(o *ossPackage, objects []oss.ObjectProperties) {
 			continue
 		}
 
-		if o.Config["syncMode"] == "2" {
-			dir, file := path.Split(o.Config["downloadDir"] + "/" + v.Key)
+		if o.config["downLoadFile"] == "1" {
+			dir, file := path.Split(o.config["downloadDir"] + "/" + v.Key)
 			if PathExists(dir) == false {
 				os.MkdirAll(dir, 0777)
 			}
@@ -97,7 +88,7 @@ func goProcess(o *ossPackage, objects []oss.ObjectProperties) {
 			}
 		}
 
-		err = o.DestBucket.PutObject(v.Key, bytes.NewReader(data))
+		err = o.destBucket.PutObject(v.Key, bytes.NewReader(data))
 		if err != nil {
 			errorObject <- v
 			continue
@@ -109,7 +100,7 @@ func goProcess(o *ossPackage, objects []oss.ObjectProperties) {
 
 func goProcessErrorObjects(o *ossPackage) {
 	for _, v := range o.errorObjects {
-		body, err := o.SourceBucket.GetObject(v.Key)
+		body, err := o.sourceBucket.GetObject(v.Key)
 		if err != nil {
 			fmt.Println(err.Error())
 			continue
@@ -121,8 +112,8 @@ func goProcessErrorObjects(o *ossPackage) {
 			continue
 		}
 
-		if o.Config["syncMode"] == "2" {
-			dir, file := path.Split(o.Config["downloadDir"] + "/" + v.Key)
+		if o.config["downLoadFile"] == "1" {
+			dir, file := path.Split(o.config["downloadDir"] + "/" + v.Key)
 			if PathExists(dir) == false {
 				os.MkdirAll(dir, 0777)
 			}
@@ -133,7 +124,7 @@ func goProcessErrorObjects(o *ossPackage) {
 			}
 		}
 
-		err = o.DestBucket.PutObject(v.Key, bytes.NewReader(data))
+		err = o.destBucket.PutObject(v.Key, bytes.NewReader(data))
 		if err != nil {
 			fmt.Println(err.Error())
 			continue
@@ -246,9 +237,9 @@ func main() {
 		fmt.Println("dest Bucket error:", err.Error())
 		return
 	}
-	if syncMode, ok := configList["syncMode"]; ok {
-		fmt.Printf("Sync Mode: %v\n", configList["syncMode"])
-		if syncMode == "2" {
+	if downLoadFile, ok := configList["downLoadFile"]; ok {
+		fmt.Printf("downLoadFile: %v\n", configList["downLoadFile"])
+		if downLoadFile == "1" {
 			if downloadDir, ok := configList["downloadDir"]; ok {
 				configList["downloadDir"] = strings.TrimRight(downloadDir, "/")
 				if configList["downloadDir"] == "" {
@@ -261,28 +252,27 @@ func main() {
 			}
 		}
 	} else {
-		fmt.Println("Fail load syncMode option!")
+		fmt.Println("Fail load downLoadFile option!")
 		return
 	}
 
 	if maxKeys, ok := configList["maxKeys"]; ok {
-		maxKeys, _ := strconv.Atoi(maxKeys)
-		if maxKeys < syncPerPage && maxKeys>0 {
+		maxKeys, err := strconv.Atoi(maxKeys)
+		if err == nil || maxKeys < syncPerPage && maxKeys > 0 {
 			syncPerPage = maxKeys
 		}
 	}
 	fmt.Println("Max keys: ", syncPerPage)
 	if _thread, ok := configList["thread"]; ok {
-		newThread, _ := strconv.Atoi(_thread)
-		if newThread<1{
-			thread = 1
+		newThread, err := strconv.Atoi(_thread)
+		if err == nil && newThread > 0 {
+			thread = newThread
 		}
-
 	}
 	fmt.Println("Threads: ", thread)
 	fmt.Println("sync start...")
 
-	ossPackage := &ossPackage{SourceBucket:sourceBucket, DestBucket:destBucket, Config:configList, processChan:make(chan string, thread)}
+	ossPackage := &ossPackage{sourceBucket:sourceBucket, destBucket:destBucket, config:configList, processChan:make(chan string, thread)}
 	err = ossPackage.ProcessObjectList()
 	if err != nil {
 		fmt.Println(err.Error())
